@@ -1,6 +1,6 @@
 #![feature(array_chunks, split_array)]
 
-use std::iter;
+use std::{iter, ops::Range};
 
 use goblin::{
     elf::{Elf, ProgramHeader},
@@ -23,7 +23,6 @@ fn main() {
 
     let elf = Elf::parse(&elf_binary).unwrap();
     assert_eq!(elf.header.e_machine, MACHINE);
-    // assert_ne!(elf.header.e_entry, 0);
 
     let relocations = elf
         .program_headers
@@ -46,15 +45,20 @@ fn main() {
         .filter(|ph| ph.exec)
         .max_by_key(|ph| ph.filesz)
         .unwrap();
+    let text_offset = text_ph.offset.try_into().unwrap();
 
-    let module_info = SceModuleInfo::take_from_bytes(
-        &mut &elf_binary[(text_ph.offset + elf.entry).try_into().unwrap()..],
-    );
+    let module_info: SceModuleInfo =
+        whole_take_from_bytes(&mut &elf_binary[text_offset..][elf.entry.try_into().unwrap()..])
+            .unwrap();
+
+    let imports: Vec<SceLibImport> =
+        whole_from_bytes_all(&elf_binary[text_offset..][module_info.stub_range()]).collect();
 
     let info = SceElfInfo {
         program_headers,
         relocations,
         module_info,
+        imports,
     };
 
     println!("{}", serde_json::to_string_pretty(&info).unwrap());
@@ -65,6 +69,7 @@ struct SceElfInfo {
     program_headers: Vec<SceProgramHeaderInfo>,
     relocations: Vec<SceRelocInfo>,
     module_info: SceModuleInfo,
+    imports: Vec<SceLibImport>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -92,71 +97,91 @@ enum SceModuleInfo {
     },
 }
 
-impl TakeFromBytes for SceModuleInfo {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self {
-        let modattribute = take_from_bytes(bytes);
-        let modversion = take_from_bytes(bytes);
-        let modname = String::from_utf8_lossy(&take_from_bytes::<[u8; 27]>(bytes)).into_owned();
-        assert_eq!(take_from_bytes::<u8>(bytes), 6);
-
-        SceModuleInfo::V6 {
-            modattribute,
-            modversion,
-            modname,
-            gp_value: take_from_bytes(bytes),
-            ent_top: take_from_bytes(bytes),
-            ent_btm: take_from_bytes(bytes),
-            stub_top: take_from_bytes(bytes),
-            stub_btm: take_from_bytes(bytes),
-            dbg_fingerprint: take_from_bytes(bytes),
-            tls_start: take_from_bytes(bytes),
-            tls_filesz: take_from_bytes(bytes),
-            tls_memsz: take_from_bytes(bytes),
-            start_entry: take_from_bytes(bytes),
-            stop_entry: take_from_bytes(bytes),
-            arm_exidx_top: take_from_bytes(bytes),
-            arm_exidx_btm: take_from_bytes(bytes),
-            arm_extab_top: take_from_bytes(bytes),
-            arm_extab_btm: take_from_bytes(bytes),
+impl SceModuleInfo {
+    fn stub_range(&self) -> Range<usize> {
+        match *self {
+            SceModuleInfo::V6 {
+                stub_top, stub_btm, ..
+            } => stub_top as _..stub_btm as _,
         }
     }
 }
 
-fn take_bytes<'a, const N: usize>(bytes: &mut &'a [u8]) -> &'a [u8; N] {
-    let out;
-    (out, *bytes) = bytes.split_array_ref();
-    out
-}
+impl TakeFromBytes for SceModuleInfo {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
+        let modattribute = take_from_bytes(bytes)?;
+        let modversion = take_from_bytes(bytes)?;
+        let modname = String::from_utf8_lossy(&take_from_bytes::<[u8; 27]>(bytes)?).into_owned();
+        assert_eq!(take_from_bytes::<u8>(bytes)?, 6);
 
-fn take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> T {
-    T::take_from_bytes(bytes)
-}
-
-trait TakeFromBytes {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self;
-}
-
-impl TakeFromBytes for u32 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self {
-        u32::from_le_bytes(*take_bytes(bytes))
+        Some(SceModuleInfo::V6 {
+            modattribute,
+            modversion,
+            modname,
+            gp_value: take_from_bytes(bytes)?,
+            ent_top: take_from_bytes(bytes)?,
+            ent_btm: take_from_bytes(bytes)?,
+            stub_top: take_from_bytes(bytes)?,
+            stub_btm: take_from_bytes(bytes)?,
+            dbg_fingerprint: take_from_bytes(bytes)?,
+            tls_start: take_from_bytes(bytes)?,
+            tls_filesz: take_from_bytes(bytes)?,
+            tls_memsz: take_from_bytes(bytes)?,
+            start_entry: take_from_bytes(bytes)?,
+            stop_entry: take_from_bytes(bytes)?,
+            arm_exidx_top: take_from_bytes(bytes)?,
+            arm_exidx_btm: take_from_bytes(bytes)?,
+            arm_extab_top: take_from_bytes(bytes)?,
+            arm_extab_btm: take_from_bytes(bytes)?,
+        })
     }
 }
 
-impl TakeFromBytes for u16 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self {
-        u16::from_le_bytes(*take_bytes(bytes))
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "size")]
+enum SceLibImport {
+    Sz52 {
+        version: u16,
+        attribute: u16,
+        nfunc: u16,
+        nvar: u16,
+        ntls: u16,
+        #[serde(skip)]
+        reserved: [u8; 4],
+        libname_nid: u32,
+        libname_addr: u32,
+        sce_sdk_version: u32,
+        func_nid_table: u32,
+        func_entry_table: u32,
+        var_nid_table: u32,
+        var_entry_table: u32,
+        tls_nid_table: u32,
+        tls_entry_table: u32,
+    },
 }
 
-impl TakeFromBytes for u8 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self {
-        u8::from_le_bytes(*take_bytes(bytes))
-    }
-}
+impl TakeFromBytes for SceLibImport {
+    fn take_from_bytes(b: &mut &[u8]) -> Option<Self> {
+        let size: u16 = take_from_bytes(b)?;
+        assert_eq!(size, 52);
 
-impl<const N: usize> TakeFromBytes for [u8; N] {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Self {
-        *take_bytes(bytes)
+        Some(SceLibImport::Sz52 {
+            version: take_from_bytes(b)?,
+            attribute: take_from_bytes(b)?,
+            nfunc: take_from_bytes(b)?,
+            nvar: take_from_bytes(b)?,
+            ntls: take_from_bytes(b)?,
+            reserved: take_from_bytes(b)?,
+            libname_nid: take_from_bytes(b)?,
+            libname_addr: take_from_bytes(b)?,
+            sce_sdk_version: take_from_bytes(b)?,
+            func_nid_table: take_from_bytes(b)?,
+            func_entry_table: take_from_bytes(b)?,
+            var_nid_table: take_from_bytes(b)?,
+            var_entry_table: take_from_bytes(b)?,
+            tls_nid_table: take_from_bytes(b)?,
+            tls_entry_table: take_from_bytes(b)?,
+        })
     }
 }
 
@@ -262,4 +287,58 @@ fn sce_pt_to_str(pt: u32) -> &'static str {
         PT_SCE_VERSION => "PT_SCE_VERSION",
         other => pt_to_str(other),
     }
+}
+
+fn take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> Option<T> {
+    T::take_from_bytes(bytes)
+}
+
+fn whole_take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> Option<T> {
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(T::take_from_bytes(bytes).unwrap())
+}
+
+fn whole_from_bytes_all<'a, T: TakeFromBytes>(mut bytes: &'a [u8]) -> impl Iterator<Item = T> + 'a {
+    iter::from_fn(move || whole_take_from_bytes(&mut bytes))
+}
+
+trait TakeFromBytes: Sized {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self>;
+}
+
+impl TakeFromBytes for u32 {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
+        Some(u32::from_le_bytes(*take_bytes(bytes)?))
+    }
+}
+
+impl TakeFromBytes for u16 {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
+        Some(u16::from_le_bytes(*take_bytes(bytes)?))
+    }
+}
+
+impl TakeFromBytes for u8 {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
+        Some(u8::from_le_bytes(*take_bytes(bytes)?))
+    }
+}
+
+impl<const N: usize> TakeFromBytes for [u8; N] {
+    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
+        take_bytes(bytes).copied()
+    }
+}
+
+fn take_bytes<'a, const N: usize>(bytes: &mut &'a [u8]) -> Option<&'a [u8; N]> {
+    if bytes.len() < N {
+        assert_eq!(bytes.len(), 0);
+        return None;
+    }
+
+    let out;
+    (out, *bytes) = bytes.split_array_ref();
+    Some(out)
 }
