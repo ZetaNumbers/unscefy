@@ -29,11 +29,9 @@ fn main() {
         .iter()
         .filter(|ph| ph.p_type == PT_SCE_RELA)
         .flat_map(|ph| {
-            let mut dwords = elf_binary[ph.p_offset.try_into().unwrap()..]
-                [..ph.p_filesz.try_into().unwrap()]
-                .array_chunks::<4>()
-                .map(|b| u32::from_le_bytes(*b));
-            iter::from_fn(move || SceRelocInfo::from_data(&mut dwords))
+            whole_from_bytes_all(
+                &elf_binary[ph.p_offset.try_into().unwrap()..][..ph.p_filesz.try_into().unwrap()],
+            )
         })
         .collect();
 
@@ -241,34 +239,34 @@ enum SceRelocInfo {
     },
 }
 
-impl SceRelocInfo {
-    fn from_data(dwords: &mut impl Iterator<Item = u32>) -> Option<SceRelocInfo> {
-        let first = dwords.next()?;
+impl TakeFromBytes for SceRelocInfo {
+    fn take_from_bytes(b: &mut &[u8]) -> Option<Self> {
+        let first: u32 = take_from_bytes(b)?;
         match first & 0xF {
             0 => {
-                let dwords = [first, dwords.next().unwrap(), dwords.next().unwrap()];
-                let typ = dwords[0] >> 8 & 0xFF;
-                let type2 = dwords[0] >> 20 & 0xFF;
+                let dword = [first, take_from_bytes(b)?, take_from_bytes(b)?];
+                let typ = dword[0] >> 8 & 0xFF;
+                let type2 = dword[0] >> 20 & 0xFF;
                 Some(SceRelocInfo::Long {
-                    symbol_segment: dwords[0] >> 4 & 0xF,
+                    symbol_segment: dword[0] >> 4 & 0xF,
                     typ: r_to_str(typ, MACHINE),
-                    patch_segment: dwords[0] >> 16 & 0xF,
+                    patch_segment: dword[0] >> 16 & 0xF,
                     type2: r_to_str(type2, MACHINE),
-                    dist2: dwords[0] >> 28 & 0xF,
-                    addend: dwords[1],
-                    offset: dwords[2],
+                    dist2: dword[0] >> 28 & 0xF,
+                    addend: dword[1],
+                    offset: dword[2],
                 })
             }
             1 => {
-                let dwords = [first, dwords.next().unwrap()];
-                let typ = dwords[0] >> 8 & 0xFF;
+                let dword = [first, take_from_bytes(b)?];
+                let typ = dword[0] >> 8 & 0xFF;
                 Some(SceRelocInfo::Short {
-                    symbol_segment: dwords[0] >> 4 & 0xF,
+                    symbol_segment: dword[0] >> 4 & 0xF,
                     typ: r_to_str(typ, MACHINE),
-                    patch_segment: dwords[0] >> 16 & 0xF,
-                    offset: dwords[0] >> 20 & 0xFFF,
-                    offset_hi: dwords[1] & 0x3FF,
-                    addend: dwords[1] >> 12 & 0x3FFFFF,
+                    patch_segment: dword[0] >> 16 & 0xF,
+                    offset: dword[0] >> 20 & 0xFFF,
+                    offset_hi: dword[1] & 0x3FF,
+                    addend: dword[1] >> 12 & 0x3FFFFF,
                 })
             }
             other => panic!("unknown SCE reloc format: {other}"),
@@ -300,7 +298,11 @@ fn whole_take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> Option<T> {
     Some(T::take_from_bytes(bytes).unwrap())
 }
 
-fn whole_from_bytes_all<'a, T: TakeFromBytes>(mut bytes: &'a [u8]) -> impl Iterator<Item = T> + 'a {
+#[allow(clippy::needless_lifetimes)]
+fn whole_from_bytes_all<'a, T>(mut bytes: &'a [u8]) -> impl Iterator<Item = T> + 'a
+where
+    T: TakeFromBytes,
+{
     iter::from_fn(move || whole_take_from_bytes(&mut bytes))
 }
 
