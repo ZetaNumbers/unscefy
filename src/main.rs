@@ -68,138 +68,120 @@ fn main() -> eyre::Result<()> {
 
     // NULL section
     sht.push(zeroed());
-    let mut shstr = vec![b'\0'];
+    let mut shstr = ShStrTab::new();
 
     let [mut text, mut bss, mut data, mut rodata] = [0; 4];
-    sht.extend(
-        pht.iter()
-            .filter(|ph| ph.p_type.get(TE) == elf::PT_LOAD)
-            .flat_map(|ph| {
-                let read = (ph.p_flags.get(TE) & elf::PF_R) != 0;
-                let writ = (ph.p_flags.get(TE) & elf::PF_W) != 0;
-                let exec = (ph.p_flags.get(TE) & elf::PF_X) != 0;
-                let sh_flags = endian::U32::new(
-                    TE,
-                    (writ as u32 * elf::SHF_WRITE)
-                        | (exec as u32 * elf::SHF_EXECINSTR)
-                        | elf::SHF_ALLOC,
-                );
+    for ph in &pht {
+        if ph.p_type.get(TE) != elf::PT_LOAD {
+            continue;
+        }
 
-                if exec {
-                    assert_eq!(ph.p_filesz, ph.p_memsz);
+        let read = (ph.p_flags.get(TE) & elf::PF_R) != 0;
+        let writ = (ph.p_flags.get(TE) & elf::PF_W) != 0;
+        let exec = (ph.p_flags.get(TE) & elf::PF_X) != 0;
+        let sh_flags =
+            (writ as u32 * elf::SHF_WRITE) | (exec as u32 * elf::SHF_EXECINSTR) | elf::SHF_ALLOC;
+        let sh_flags = endian::U32::new(TE, sh_flags);
 
-                    let sh_name = endian::U32::new(TE, shstr.len().try_into().unwrap());
-                    if text == 0 {
-                        shstr.extend(b".text\0")
-                    } else {
-                        std::write!(shstr, ".text{text}\0").unwrap();
-                    }
-                    text += 1;
-                    vec![elf::SectionHeader32 {
-                        sh_name,
-                        sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
-                        sh_flags,
-                        sh_addr: ph.p_vaddr,
-                        sh_offset: ph.p_offset,
-                        sh_size: ph.p_filesz,
-                        sh_addralign: ph.p_align,
-                        ..zeroed()
-                    }]
-                } else if writ {
-                    let (data_sz, bss_sz) = (
-                        ph.p_filesz.get(TE),
-                        ph.p_memsz.get(TE).checked_sub(ph.p_filesz.get(TE)).unwrap(),
-                    );
-                    (data_sz > 0)
-                        .then(|| {
-                            let sh_name = endian::U32::new(TE, shstr.len().try_into().unwrap());
-                            if data == 0 {
-                                shstr.extend(b".data\0")
-                            } else {
-                                std::write!(shstr, ".data{data}\0").unwrap();
-                            }
-                            data += 1;
-                            elf::SectionHeader32 {
-                                sh_name,
-                                sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
-                                sh_flags,
-                                sh_addr: ph.p_vaddr,
-                                sh_offset: ph.p_offset,
-                                sh_size: ph.p_filesz,
-                                sh_addralign: ph.p_align,
-                                ..zeroed()
-                            }
-                        })
-                        .into_iter()
-                        .chain((bss_sz > 0).then(|| {
-                            let sh_name = endian::U32::new(TE, shstr.len().try_into().unwrap());
-                            if bss == 0 {
-                                shstr.extend(b".bss\0")
-                            } else {
-                                std::write!(shstr, ".bss{bss}\0").unwrap();
-                            }
-                            bss += 1;
-                            let sh_addralign = ph.p_align.get(TE);
-                            let sh_addralign = sh_addralign
-                                .checked_shr(
-                                    sh_addralign
-                                        .trailing_zeros()
-                                        .saturating_sub(data_sz.trailing_zeros()),
-                                )
-                                .unwrap_or(0);
-                            elf::SectionHeader32 {
-                                sh_name,
-                                sh_type: endian::U32::new(TE, elf::SHT_NOBITS),
-                                sh_flags,
-                                sh_addr: endian::U32::new(TE, ph.p_vaddr.get(TE) + data_sz),
-                                sh_offset: endian::U32::new(TE, 0),
-                                sh_size: ph.p_memsz,
-                                sh_addralign: endian::U32::new(TE, sh_addralign),
-                                ..zeroed()
-                            }
-                        }))
-                        .collect()
-                } else if read {
-                    assert_eq!(ph.p_filesz, ph.p_memsz);
+        if exec {
+            assert_eq!(ph.p_filesz, ph.p_memsz);
 
-                    let sh_name = endian::U32::new(TE, shstr.len().try_into().unwrap());
-                    if rodata == 0 {
-                        shstr.extend(b".rodata\0")
-                    } else {
-                        std::write!(shstr, ".rodata{rodata}\0").unwrap();
-                    }
-                    rodata += 1;
-                    vec![elf::SectionHeader32 {
-                        sh_name,
-                        sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
-                        sh_flags,
-                        sh_addr: ph.p_vaddr,
-                        sh_offset: ph.p_offset,
-                        sh_size: ph.p_filesz,
-                        sh_addralign: ph.p_align,
-                        ..zeroed()
-                    }]
+            let sh_name = if text == 0 {
+                std::write!(shstr, ".text")
+            } else {
+                std::write!(shstr, ".text{text}")
+            }
+            .unwrap();
+            text += 1;
+
+            sht.push(elf::SectionHeader32 {
+                sh_name: endian::U32::new(TE, sh_name),
+                sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                sh_flags,
+                sh_addr: ph.p_vaddr,
+                sh_offset: ph.p_offset,
+                sh_size: ph.p_filesz,
+                sh_addralign: ph.p_align,
+                ..zeroed()
+            })
+        } else if writ {
+            let (data_sz, bss_sz) = (
+                ph.p_filesz.get(TE),
+                ph.p_memsz
+                    .get(TE)
+                    .checked_sub(ph.p_filesz.get(TE))
+                    .expect("sh_memsz < sh_filesz"),
+            );
+            if data_sz > 0 {
+                let sh_name = if data == 0 {
+                    std::write!(shstr, ".data")
                 } else {
-                    Vec::new()
+                    std::write!(shstr, ".data{data}")
                 }
-            }),
-    );
+                .unwrap();
+                data += 1;
+                sht.push(elf::SectionHeader32 {
+                    sh_name: endian::U32::new(TE, sh_name),
+                    sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                    sh_flags,
+                    sh_addr: ph.p_vaddr,
+                    sh_offset: ph.p_offset,
+                    sh_size: ph.p_filesz,
+                    sh_addralign: ph.p_align,
+                    ..zeroed()
+                });
+            }
+            if bss_sz > 0 {
+                let sh_name = if bss == 0 {
+                    std::write!(shstr, ".bss")
+                } else {
+                    std::write!(shstr, ".bss{bss}")
+                }
+                .unwrap();
+                bss += 1;
+                let sh_addralign = ph.p_align.get(TE);
+                let sh_addralign = sh_addralign
+                    .checked_shr(
+                        sh_addralign
+                            .trailing_zeros()
+                            .saturating_sub(data_sz.trailing_zeros()),
+                    )
+                    .unwrap_or(0);
+                sht.push(elf::SectionHeader32 {
+                    sh_name: endian::U32::new(TE, sh_name),
+                    sh_type: endian::U32::new(TE, elf::SHT_NOBITS),
+                    sh_flags,
+                    sh_addr: endian::U32::new(TE, ph.p_vaddr.get(TE) + data_sz),
+                    sh_size: ph.p_memsz,
+                    sh_addralign: endian::U32::new(TE, sh_addralign),
+                    ..zeroed()
+                });
+            }
+        } else if read {
+            assert_eq!(ph.p_filesz, ph.p_memsz);
+
+            let sh_name = if rodata == 0 {
+                std::write!(shstr, ".rodata")
+            } else {
+                std::write!(shstr, ".rodata{rodata}")
+            }
+            .unwrap();
+            rodata += 1;
+            sht.push(elf::SectionHeader32 {
+                sh_name: endian::U32::new(TE, sh_name),
+                sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                sh_flags,
+                sh_addr: ph.p_vaddr,
+                sh_offset: ph.p_offset,
+                sh_size: ph.p_filesz,
+                sh_addralign: ph.p_align,
+                ..zeroed()
+            })
+        }
+    }
 
     // Write section headers name table
-    let sh_name = endian::U32::new(TE, shstr.len().try_into()?);
-    shstr.extend(b".shstrtab\0");
-    let sh_offset = endian::U32::new(TE, file.seek(io::SeekFrom::End(0))?.try_into()?);
-    file.write_all(&shstr)?;
-    let sh_size = endian::U32::new(TE, shstr.len().try_into()?);
-    eh.e_shstrndx.set(TE, sht.len().try_into()?);
-    sht.push(elf::SectionHeader32 {
-        sh_name,
-        sh_type: endian::U32::new(TE, elf::SHT_STRTAB),
-        sh_offset,
-        sh_size,
-        sh_addralign: endian::U32::new(TE, 1),
-        ..zeroed()
-    });
+    shstr.finalize(&mut file, &mut eh, &mut sht)?;
 
     // Write section headers
     eh.e_shoff
@@ -266,6 +248,58 @@ fn load_header(file: &mut fs::File) -> eyre::Result<elf::FileHeader32<TE>> {
     );
 
     Ok(eh)
+}
+
+struct ShStrTab {
+    data: Vec<u8>,
+}
+
+impl ShStrTab {
+    fn new() -> Self {
+        ShStrTab { data: vec![b'\0'] }
+    }
+
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<u32> {
+        let cur = self.size();
+        self.data.write_fmt(format_args!("{args}\0"))?;
+        Ok(cur)
+    }
+
+    fn size(&self) -> u32 {
+        self.data
+            .len()
+            .try_into()
+            .expect("'.shstrtab' section size exceeded 32 bit limit")
+    }
+
+    fn finalize(
+        mut self,
+        file: &mut fs::File,
+        eh: &mut elf::FileHeader32<TE>,
+        sht: &mut Vec<elf::SectionHeader32<TE>>,
+    ) -> io::Result<()> {
+        let sh_name = write!(self, ".shstrtab")?;
+        let sh_offset = file
+            .seek(io::SeekFrom::End(0))?
+            .try_into()
+            .expect("file size exceeded 32 bits");
+        file.write_all(&self.data)?;
+        eh.e_shstrndx.set(
+            TE,
+            sht.len()
+                .try_into()
+                .expect("exceeded 16 bit section header table limit"),
+        );
+        sht.push(elf::SectionHeader32 {
+            sh_name: endian::U32::new(TE, sh_name),
+            sh_type: endian::U32::new(TE, elf::SHT_STRTAB),
+            sh_offset: endian::U32::new(TE, sh_offset),
+            sh_size: endian::U32::new(TE, self.size()),
+            sh_addralign: endian::U32::new(TE, 1),
+            ..zeroed()
+        });
+        Ok(())
+    }
 }
 
 fn zeroed<T>() -> T
