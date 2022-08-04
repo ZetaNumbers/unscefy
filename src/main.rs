@@ -1,19 +1,30 @@
-#![feature(array_chunks, split_array)]
+#![feature(array_chunks, split_array, int_roundings, strict_provenance)]
 
-use std::{iter, ops::Range};
+// mod vmem;
+mod bits;
+mod take_from_bytes;
 
+use std::{ops::Range, ptr};
+
+use bits::Bits;
 use goblin::{
     elf::{Elf, ProgramHeader},
     elf32::{
         header::EM_ARM,
-        program_header::{pt_to_str, PF_R, PF_W, PF_X},
+        program_header::{pt_to_str, PF_R, PF_W, PF_X, PT_LOAD},
         reloc::r_to_str,
     },
+};
+
+use take_from_bytes::{
+    take_from_bytes, whole_from_bytes_all, whole_take_from_bytes, TakeFromBytes,
 };
 
 const MACHINE: u16 = EM_ARM;
 
 fn main() {
+    assert!(std::mem::size_of::<usize>() >= 4);
+
     let elf_binary = std::fs::read(
         std::env::args()
             .nth(1)
@@ -35,8 +46,22 @@ fn main() {
         })
         .collect();
 
-    let program_headers: Vec<SceProgramHeaderInfo> =
+    let mut program_headers: Vec<SceProgramHeaderInfo> =
         elf.program_headers.iter().map(|ph| ph.into()).collect();
+
+    program_headers
+        .iter_mut()
+        .filter(|ph| ph.typ == PT_LOAD)
+        .for_each(|ph| {
+            ph.loaded = Some(
+                region::alloc_at(
+                    ptr::invalid::<u8>(ph.vaddr.try_into().unwrap()),
+                    ph.memsz.try_into().unwrap(),
+                    region::Protection::READ_WRITE,
+                )
+                .unwrap(),
+            );
+        });
 
     let text_ph = program_headers
         .iter()
@@ -62,7 +87,7 @@ fn main() {
     println!("{}", serde_json::to_string_pretty(&info).unwrap());
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(serde::Serialize)]
 struct SceElfInfo {
     program_headers: Vec<SceProgramHeaderInfo>,
     relocations: Vec<SceRelocInfo>,
@@ -77,7 +102,6 @@ enum SceModuleInfo {
         modattribute: u16,
         modversion: [u8; 2],
         modname: String,
-        gp_value: u32,
         ent_top: u32,
         ent_btm: u32,
         stub_top: u32,
@@ -111,12 +135,12 @@ impl TakeFromBytes for SceModuleInfo {
         let modversion = take_from_bytes(bytes)?;
         let modname = String::from_utf8_lossy(&take_from_bytes::<[u8; 27]>(bytes)?).into_owned();
         assert_eq!(take_from_bytes::<u8>(bytes)?, 6);
+        assert_eq!(take_from_bytes::<u32>(bytes)?, 0);
 
         Some(SceModuleInfo::V6 {
             modattribute,
             modversion,
             modname,
-            gp_value: take_from_bytes(bytes)?,
             ent_top: take_from_bytes(bytes)?,
             ent_btm: take_from_bytes(bytes)?,
             stub_top: take_from_bytes(bytes)?,
@@ -138,14 +162,19 @@ impl TakeFromBytes for SceModuleInfo {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "size")]
 enum SceLibImport {
+    Sz36 {
+        version: u16,
+        attribute: u16,
+        libname_nid: u32,
+        libname_addr: u32,
+        func_nid_table: u32,
+        func_entry_table: u32,
+        var_nid_table: u32,
+        var_entry_table: u32,
+    },
     Sz52 {
         version: u16,
         attribute: u16,
-        nfunc: u16,
-        nvar: u16,
-        ntls: u16,
-        #[serde(skip)]
-        reserved: [u8; 4],
         libname_nid: u32,
         libname_addr: u32,
         sce_sdk_version: u32,
@@ -161,32 +190,69 @@ enum SceLibImport {
 impl TakeFromBytes for SceLibImport {
     fn take_from_bytes(b: &mut &[u8]) -> Option<Self> {
         let size: u16 = take_from_bytes(b)?;
-        assert_eq!(size, 52);
-
-        Some(SceLibImport::Sz52 {
-            version: take_from_bytes(b)?,
-            attribute: take_from_bytes(b)?,
-            nfunc: take_from_bytes(b)?,
-            nvar: take_from_bytes(b)?,
-            ntls: take_from_bytes(b)?,
-            reserved: take_from_bytes(b)?,
-            libname_nid: take_from_bytes(b)?,
-            libname_addr: take_from_bytes(b)?,
-            sce_sdk_version: take_from_bytes(b)?,
-            func_nid_table: take_from_bytes(b)?,
-            func_entry_table: take_from_bytes(b)?,
-            var_nid_table: take_from_bytes(b)?,
-            var_entry_table: take_from_bytes(b)?,
-            tls_nid_table: take_from_bytes(b)?,
-            tls_entry_table: take_from_bytes(b)?,
-        })
+        match size {
+            36 => {
+                let version = take_from_bytes(b)?;
+                let attribute = take_from_bytes(b)?;
+                let nfunc: u16 = take_from_bytes(b)?;
+                let nvar: u16 = take_from_bytes(b)?;
+                let ntls: u16 = take_from_bytes(b)?;
+                let libname_nid = take_from_bytes(b)?;
+                let libname_addr = take_from_bytes(b)?;
+                let func_nid_table = take_from_bytes(b)?;
+                let func_entry_table = take_from_bytes(b)?;
+                let var_nid_table = take_from_bytes(b)?;
+                let var_entry_table = take_from_bytes(b)?;
+                Some(SceLibImport::Sz36 {
+                    version,
+                    attribute,
+                    libname_nid,
+                    libname_addr,
+                    func_nid_table,
+                    func_entry_table,
+                    var_nid_table,
+                    var_entry_table,
+                })
+            }
+            52 => {
+                let version = take_from_bytes(b)?;
+                let attribute = take_from_bytes(b)?;
+                let nfunc: u16 = take_from_bytes(b)?;
+                let nvar: u16 = take_from_bytes(b)?;
+                let ntls: u16 = take_from_bytes(b)?;
+                let _reserved: [u8; 4] = take_from_bytes(b)?;
+                let libname_nid = take_from_bytes(b)?;
+                let libname_addr = take_from_bytes(b)?;
+                let sce_sdk_version = take_from_bytes(b)?;
+                let func_nid_table = take_from_bytes(b)?;
+                let func_entry_table = take_from_bytes(b)?;
+                let var_nid_table = take_from_bytes(b)?;
+                let var_entry_table = take_from_bytes(b)?;
+                let tls_nid_table = take_from_bytes(b)?;
+                let tls_entry_table = take_from_bytes(b)?;
+                Some(SceLibImport::Sz52 {
+                    version,
+                    attribute,
+                    libname_nid,
+                    libname_addr,
+                    sce_sdk_version,
+                    func_nid_table,
+                    func_entry_table,
+                    var_nid_table,
+                    var_entry_table,
+                    tls_nid_table,
+                    tls_entry_table,
+                })
+            }
+            other => unimplemented!("SceLibImport::Sz{other}"),
+        }
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(serde::Serialize)]
 struct SceProgramHeaderInfo {
-    #[serde(rename = "type")]
-    typ: &'static str,
+    #[serde(rename = "type", serialize_with = "sce_pt_serialize")]
+    typ: u32,
     offset: u64,
     filesz: u64,
     read: bool,
@@ -196,12 +262,21 @@ struct SceProgramHeaderInfo {
     paddr: u64,
     memsz: u64,
     align: u64,
+    #[serde(skip)]
+    loaded: Option<region::Allocation>,
+}
+
+fn sce_pt_serialize<S>(p_type: &u32, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    ser.serialize_str(sce_pt_to_str(*p_type))
 }
 
 impl From<&ProgramHeader> for SceProgramHeaderInfo {
     fn from(ph: &ProgramHeader) -> Self {
         SceProgramHeaderInfo {
-            typ: sce_pt_to_str(ph.p_type),
+            typ: ph.p_type,
             read: ph.p_flags & PF_R != 0,
             write: ph.p_flags & PF_W != 0,
             exec: ph.p_flags & PF_X != 0,
@@ -211,6 +286,7 @@ impl From<&ProgramHeader> for SceProgramHeaderInfo {
             paddr: ph.p_paddr,
             memsz: ph.p_memsz,
             align: ph.p_align,
+            loaded: None,
         }
     }
 }
@@ -218,59 +294,135 @@ impl From<&ProgramHeader> for SceProgramHeaderInfo {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "format")]
 enum SceRelocInfo {
-    Long {
+    Fmt0 {
         symbol_segment: u32,
-        #[serde(rename = "type")]
-        typ: &'static str,
+        #[serde(rename = "type", serialize_with = "sce_reloc_type_serialize")]
+        typ: u32,
         patch_segment: u32,
-        type2: &'static str,
+        #[serde(serialize_with = "sce_reloc_type_serialize")]
+        type2: u32,
         dist2: u32,
         addend: u32,
         offset: u32,
     },
-    Short {
+    Fmt1 {
         symbol_segment: u32,
-        #[serde(rename = "type")]
-        typ: &'static str,
+        #[serde(rename = "type", serialize_with = "sce_reloc_type_serialize")]
+        typ: u32,
         patch_segment: u32,
         offset: u32,
         offset_hi: u32,
         addend: u32,
     },
+    Fmt2 {
+        symbol_segment: u32,
+        #[serde(rename = "type", serialize_with = "sce_reloc_type_serialize")]
+        typ: u32,
+        offset: u32,
+        addend: u32,
+    },
+    Fmt3 {
+        symbol_segment: u32,
+        ins_mode: u32,
+        offset: u32,
+        dist2: u32,
+        addend: u32,
+    },
+    Fmt4 {
+        offset: u32,
+        dist2: u32,
+    },
+    Fmt5 {
+        dist1: u32,
+        dist2: u32,
+        dist3: u32,
+        dist4: u32,
+    },
+    Fmt6 {
+        offset: u32,
+    },
+    Fmt7 {
+        offsets: [u32; 4],
+    },
+    Fmt8 {
+        offsets: [u32; 7],
+    },
+    Fmt9 {
+        offsets: [u32; 14],
+    },
+}
+
+fn sce_reloc_type_serialize<S>(p_type: &u32, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    ser.serialize_str(r_to_str(*p_type, MACHINE))
 }
 
 impl TakeFromBytes for SceRelocInfo {
     fn take_from_bytes(b: &mut &[u8]) -> Option<Self> {
-        let first: u32 = take_from_bytes(b)?;
-        match first & 0xF {
-            0 => {
-                let dword = [first, take_from_bytes(b)?, take_from_bytes(b)?];
-                let typ = dword[0] >> 8 & 0xFF;
-                let type2 = dword[0] >> 20 & 0xFF;
-                Some(SceRelocInfo::Long {
-                    symbol_segment: dword[0] >> 4 & 0xF,
-                    typ: r_to_str(typ, MACHINE),
-                    patch_segment: dword[0] >> 16 & 0xF,
-                    type2: r_to_str(type2, MACHINE),
-                    dist2: dword[0] >> 28 & 0xF,
-                    addend: dword[1],
-                    offset: dword[2],
-                })
+        let mut b = Bits::take_from_bytes(b, false);
+        let format = b.take(4)?;
+        let res = Some(match format {
+            0 => SceRelocInfo::Fmt0 {
+                symbol_segment: b.take(4)?,
+                typ: b.take(8)?,
+                patch_segment: b.take(4)?,
+                type2: b.take(8)?,
+                dist2: b.take(4)?,
+                addend: b.take(32)?,
+                offset: b.take(32)?,
+            },
+            1 => SceRelocInfo::Fmt1 {
+                symbol_segment: b.take(4)?,
+                typ: b.take(8)?,
+                patch_segment: b.take(4)?,
+                offset: b.take(12)?,
+                offset_hi: b.take(10)?,
+                addend: b.take(22)?,
+            },
+            2 => SceRelocInfo::Fmt2 {
+                symbol_segment: b.take(4)?,
+                typ: b.take(8)?,
+                offset: b.take(16)?,
+                addend: b.take(32)?,
+            },
+            3 => {
+                b.padding = true;
+                SceRelocInfo::Fmt3 {
+                    symbol_segment: b.take(4)?,
+                    ins_mode: b.take(1)?,
+                    offset: b.take(18)?,
+                    dist2: b.take(5)?,
+                    addend: b.take(22)?,
+                }
             }
-            1 => {
-                let dword = [first, take_from_bytes(b)?];
-                let typ = dword[0] >> 8 & 0xFF;
-                Some(SceRelocInfo::Short {
-                    symbol_segment: dword[0] >> 4 & 0xF,
-                    typ: r_to_str(typ, MACHINE),
-                    patch_segment: dword[0] >> 16 & 0xF,
-                    offset: dword[0] >> 20 & 0xFFF,
-                    offset_hi: dword[1] & 0x3FF,
-                    addend: dword[1] >> 12 & 0x3FFFFF,
-                })
-            }
-            other => panic!("unknown SCE reloc format: {other}"),
-        }
+            4 => SceRelocInfo::Fmt4 {
+                offset: b.take(23)?,
+                dist2: b.take(5)?,
+            },
+            5 => SceRelocInfo::Fmt5 {
+                dist1: b.take(9)?,
+                dist2: b.take(5)?,
+                dist3: b.take(9)?,
+                dist4: b.take(5)?,
+            },
+            6 => SceRelocInfo::Fmt6 {
+                offset: b.take(28)?,
+            },
+            7 => SceRelocInfo::Fmt7 {
+                offsets: b.take_array(7)?,
+            },
+            8 => SceRelocInfo::Fmt8 {
+                offsets: b.take_array(4)?,
+            },
+            9 => SceRelocInfo::Fmt9 {
+                offsets: b.take_array(2)?,
+            },
+            other => unimplemented!("SceRelocInfo::Fmt{other}"),
+        });
+        assert!(b.padding || b.holding_bits() == 0, "{res:?}");
+        res
     }
 }
 
@@ -287,60 +439,15 @@ fn sce_pt_to_str(pt: u32) -> &'static str {
     }
 }
 
-fn take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> Option<T> {
-    T::take_from_bytes(bytes)
+struct Segment<'a> {
+    base_vaddr: u32,
+    bytes: &'a [u8],
+    relocs: &'a [SceRelocInfo],
 }
 
-fn whole_take_from_bytes<T: TakeFromBytes>(bytes: &mut &[u8]) -> Option<T> {
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(T::take_from_bytes(bytes).unwrap())
-}
-
-#[allow(clippy::needless_lifetimes)]
-fn whole_from_bytes_all<'a, T>(mut bytes: &'a [u8]) -> impl Iterator<Item = T> + 'a
-where
-    T: TakeFromBytes,
-{
-    iter::from_fn(move || whole_take_from_bytes(&mut bytes))
-}
-
-trait TakeFromBytes: Sized {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self>;
-}
-
-impl TakeFromBytes for u32 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
-        Some(u32::from_le_bytes(*take_bytes(bytes)?))
-    }
-}
-
-impl TakeFromBytes for u16 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
-        Some(u16::from_le_bytes(*take_bytes(bytes)?))
-    }
-}
-
-impl TakeFromBytes for u8 {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
-        Some(u8::from_le_bytes(*take_bytes(bytes)?))
-    }
-}
-
-impl<const N: usize> TakeFromBytes for [u8; N] {
-    fn take_from_bytes(bytes: &mut &[u8]) -> Option<Self> {
-        take_bytes(bytes).copied()
-    }
-}
-
-fn take_bytes<'a, const N: usize>(bytes: &mut &'a [u8]) -> Option<&'a [u8; N]> {
-    if bytes.len() < N {
-        assert_eq!(bytes.len(), 0);
-        return None;
-    }
-
-    let out;
-    (out, *bytes) = bytes.split_array_ref();
-    Some(out)
+struct Relocation {
+    pointee_segment: u32,
+    pointee_offset: u32,
+    pointer_segment: u32,
+    pointer_offset: u32,
 }
