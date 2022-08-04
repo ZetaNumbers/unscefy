@@ -23,8 +23,6 @@ const _: () = assert!(mem::size_of::<isize>() >= 4);
 
 /// target endian
 type TE = object::LittleEndian;
-#[allow(non_upper_case_globals)]
-const TE: TE = object::LittleEndian;
 
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
@@ -46,15 +44,16 @@ fn main() -> eyre::Result<()> {
     let mut eh = load_header(&mut file)
         .wrap_err("Error while loading ELF file header, perhaps input file is not an ELF")?;
 
-    let mut pht = vec![zeroed::<elf::ProgramHeader32<TE>>(); eh.e_phnum.get(TE) as usize];
+    let mut pht = vec![zeroed::<elf::ProgramHeader32<TE>>(); eh.e_phnum.getn() as usize];
+
     if !pht.is_empty() {
-        file.seek(io::SeekFrom::Start(eh.e_phoff.get(TE).into()))?;
+        file.seek(io::SeekFrom::Start(eh.e_phoff.getn().into()))?;
         file.read_exact(pod::bytes_of_slice_mut(&mut pht))?;
     }
 
-    let mut sht = vec![zeroed::<elf::SectionHeader32<TE>>(); eh.e_shnum.get(TE) as usize];
+    let mut sht = vec![zeroed::<elf::SectionHeader32<TE>>(); eh.e_shnum.getn() as usize];
     if !sht.is_empty() {
-        file.seek(io::SeekFrom::Start(eh.e_shoff.get(TE).into()))?;
+        file.seek(io::SeekFrom::Start(eh.e_shoff.getn().into()))?;
         file.read_exact(pod::bytes_of_slice_mut(&mut sht))?;
     }
     assert!(sht.is_empty());
@@ -64,7 +63,7 @@ fn main() -> eyre::Result<()> {
         sce::PT_SCE_COMMENT,
         sce::PT_SCE_VERSION
     ]
-    .contains(&ph.p_type.get(TE))));
+    .contains(&ph.p_type.getn())));
 
     // NULL section
     sht.push(zeroed());
@@ -72,16 +71,16 @@ fn main() -> eyre::Result<()> {
 
     let [mut text, mut bss, mut data, mut rodata] = [0; 4];
     for ph in &pht {
-        if ph.p_type.get(TE) != elf::PT_LOAD {
+        if ph.p_type.getn() != elf::PT_LOAD {
             continue;
         }
 
-        let read = (ph.p_flags.get(TE) & elf::PF_R) != 0;
-        let writ = (ph.p_flags.get(TE) & elf::PF_W) != 0;
-        let exec = (ph.p_flags.get(TE) & elf::PF_X) != 0;
+        let read = (ph.p_flags.getn() & elf::PF_R) != 0;
+        let writ = (ph.p_flags.getn() & elf::PF_W) != 0;
+        let exec = (ph.p_flags.getn() & elf::PF_X) != 0;
         let sh_flags =
             (writ as u32 * elf::SHF_WRITE) | (exec as u32 * elf::SHF_EXECINSTR) | elf::SHF_ALLOC;
-        let sh_flags = endian::U32::new(TE, sh_flags);
+        let sh_flags = ea(sh_flags);
 
         if exec {
             assert_eq!(ph.p_filesz, ph.p_memsz);
@@ -95,8 +94,8 @@ fn main() -> eyre::Result<()> {
             text += 1;
 
             sht.push(elf::SectionHeader32 {
-                sh_name: endian::U32::new(TE, sh_name),
-                sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                sh_name: ea(sh_name),
+                sh_type: ea(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
                 sh_offset: ph.p_offset,
@@ -106,10 +105,10 @@ fn main() -> eyre::Result<()> {
             })
         } else if writ {
             let (data_sz, bss_sz) = (
-                ph.p_filesz.get(TE),
+                ph.p_filesz.getn(),
                 ph.p_memsz
-                    .get(TE)
-                    .checked_sub(ph.p_filesz.get(TE))
+                    .getn()
+                    .checked_sub(ph.p_filesz.getn())
                     .expect("sh_memsz < sh_filesz"),
             );
             if data_sz > 0 {
@@ -121,8 +120,8 @@ fn main() -> eyre::Result<()> {
                 .unwrap();
                 data += 1;
                 sht.push(elf::SectionHeader32 {
-                    sh_name: endian::U32::new(TE, sh_name),
-                    sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                    sh_name: ea(sh_name),
+                    sh_type: ea(elf::SHT_PROGBITS),
                     sh_flags,
                     sh_addr: ph.p_vaddr,
                     sh_offset: ph.p_offset,
@@ -139,7 +138,7 @@ fn main() -> eyre::Result<()> {
                 }
                 .unwrap();
                 bss += 1;
-                let sh_addralign = ph.p_align.get(TE);
+                let sh_addralign = ph.p_align.getn();
                 let sh_addralign = sh_addralign
                     .checked_shr(
                         sh_addralign
@@ -148,12 +147,12 @@ fn main() -> eyre::Result<()> {
                     )
                     .unwrap_or(0);
                 sht.push(elf::SectionHeader32 {
-                    sh_name: endian::U32::new(TE, sh_name),
-                    sh_type: endian::U32::new(TE, elf::SHT_NOBITS),
+                    sh_name: ea(sh_name),
+                    sh_type: ea(elf::SHT_NOBITS),
                     sh_flags,
-                    sh_addr: endian::U32::new(TE, ph.p_vaddr.get(TE) + data_sz),
+                    sh_addr: ea(ph.p_vaddr.getn() + data_sz),
                     sh_size: ph.p_memsz,
-                    sh_addralign: endian::U32::new(TE, sh_addralign),
+                    sh_addralign: ea(sh_addralign),
                     ..zeroed()
                 });
             }
@@ -168,8 +167,8 @@ fn main() -> eyre::Result<()> {
             .unwrap();
             rodata += 1;
             sht.push(elf::SectionHeader32 {
-                sh_name: endian::U32::new(TE, sh_name),
-                sh_type: endian::U32::new(TE, elf::SHT_PROGBITS),
+                sh_name: ea(sh_name),
+                sh_type: ea(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
                 sh_offset: ph.p_offset,
@@ -184,12 +183,10 @@ fn main() -> eyre::Result<()> {
     shstr.finalize(&mut file, &mut eh, &mut sht)?;
 
     // Write section headers
-    eh.e_shoff
-        .set(TE, file.seek(io::SeekFrom::End(0))?.try_into()?);
+    eh.e_shoff = ea(file.seek(io::SeekFrom::End(0))?.try_into()?);
     file.write_all(pod::bytes_of_slice(&sht))?;
-    eh.e_shentsize
-        .set(TE, mem::size_of::<elf::SectionHeader32<TE>>().try_into()?);
-    eh.e_shnum.set(TE, sht.len().try_into()?);
+    eh.e_shentsize = ea(mem::size_of::<elf::SectionHeader32<TE>>().try_into()?);
+    eh.e_shnum = ea(sht.len().try_into()?);
 
     // Override ELF header
     file.rewind()?;
@@ -223,28 +220,28 @@ fn load_header(file: &mut fs::File) -> eyre::Result<elf::FileHeader32<TE>> {
         eh.e_ident.version
     );
     eyre::ensure!(
-        eh.e_machine.get(TE) == elf::EM_ARM,
+        eh.e_machine.getn() == elf::EM_ARM,
         "Wrong target arch: {}",
-        eh.e_machine.get(TE),
+        eh.e_machine.getn(),
     );
-    if eh.e_shnum.get(TE) != 0 {
+    if eh.e_shnum.getn() != 0 {
         eyre::ensure!(
-            mem::size_of::<elf::SectionHeader32<TE>>() == eh.e_shentsize.get(TE).try_into()?,
+            mem::size_of::<elf::SectionHeader32<TE>>() == eh.e_shentsize.getn().try_into()?,
             "Wrong section header entry size: {}",
-            eh.e_shentsize.get(TE),
+            eh.e_shentsize.getn(),
         );
     }
-    if eh.e_phnum.get(TE) != 0 {
+    if eh.e_phnum.getn() != 0 {
         eyre::ensure!(
-            mem::size_of::<elf::ProgramHeader32<TE>>() == eh.e_phentsize.get(TE).try_into()?,
+            mem::size_of::<elf::ProgramHeader32<TE>>() == eh.e_phentsize.getn().try_into()?,
             "Wrong program header entry size: {}",
-            eh.e_phentsize.get(TE),
+            eh.e_phentsize.getn(),
         );
     }
     eyre::ensure!(
-        ALL_ET_SCE.contains(&eh.e_type.get(TE)),
+        ALL_ET_SCE.contains(&eh.e_type.getn()),
         "Wrong ELF type: {}",
-        eh.e_type.get(TE)
+        eh.e_type.getn()
     );
 
     Ok(eh)
@@ -284,21 +281,63 @@ impl ShStrTab {
             .try_into()
             .expect("file size exceeded 32 bits");
         file.write_all(&self.data)?;
-        eh.e_shstrndx.set(
-            TE,
-            sht.len()
-                .try_into()
-                .expect("exceeded 16 bit section header table limit"),
-        );
+        eh.e_shstrndx = ea(sht
+            .len()
+            .try_into()
+            .expect("exceeded 16 bit section header table limit"));
         sht.push(elf::SectionHeader32 {
-            sh_name: endian::U32::new(TE, sh_name),
-            sh_type: endian::U32::new(TE, elf::SHT_STRTAB),
-            sh_offset: endian::U32::new(TE, sh_offset),
-            sh_size: endian::U32::new(TE, self.size()),
-            sh_addralign: endian::U32::new(TE, 1),
+            sh_name: ea(sh_name),
+            sh_type: ea(elf::SHT_STRTAB),
+            sh_offset: ea(sh_offset),
+            sh_size: ea(self.size()),
+            sh_addralign: ea(1),
             ..zeroed()
         });
         Ok(())
+    }
+}
+
+fn ea<T>(n: T::Native) -> T
+where
+    T: DefaultEndianAgnosticUtils,
+{
+    T::from_native(n)
+}
+
+trait DefaultEndianAgnosticUtils {
+    type Native;
+
+    fn getn(self) -> Self::Native;
+    fn from_native(n: Self::Native) -> Self;
+}
+
+impl<E> DefaultEndianAgnosticUtils for endian::U32<E>
+where
+    E: endian::Endian + Default,
+{
+    type Native = u32;
+
+    fn getn(self) -> Self::Native {
+        self.get(Default::default())
+    }
+
+    fn from_native(n: Self::Native) -> Self {
+        Self::new(Default::default(), n)
+    }
+}
+
+impl<E> DefaultEndianAgnosticUtils for endian::U16<E>
+where
+    E: endian::Endian + Default,
+{
+    type Native = u16;
+
+    fn getn(self) -> Self::Native {
+        self.get(Default::default())
+    }
+
+    fn from_native(n: Self::Native) -> Self {
+        Self::new(Default::default(), n)
     }
 }
 
