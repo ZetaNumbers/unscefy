@@ -80,7 +80,7 @@ fn main() -> eyre::Result<()> {
         let exec = (ph.p_flags.getn() & elf::PF_X) != 0;
         let sh_flags =
             (writ as u32 * elf::SHF_WRITE) | (exec as u32 * elf::SHF_EXECINSTR) | elf::SHF_ALLOC;
-        let sh_flags = ea(sh_flags);
+        let sh_flags = ede(sh_flags);
 
         if exec {
             assert_eq!(ph.p_filesz, ph.p_memsz);
@@ -94,8 +94,8 @@ fn main() -> eyre::Result<()> {
             text += 1;
 
             sht.push(elf::SectionHeader32 {
-                sh_name: ea(sh_name),
-                sh_type: ea(elf::SHT_PROGBITS),
+                sh_name: ede(sh_name),
+                sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
                 sh_offset: ph.p_offset,
@@ -120,8 +120,8 @@ fn main() -> eyre::Result<()> {
                 .unwrap();
                 data += 1;
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ea(sh_name),
-                    sh_type: ea(elf::SHT_PROGBITS),
+                    sh_name: ede(sh_name),
+                    sh_type: ede(elf::SHT_PROGBITS),
                     sh_flags,
                     sh_addr: ph.p_vaddr,
                     sh_offset: ph.p_offset,
@@ -147,12 +147,12 @@ fn main() -> eyre::Result<()> {
                     )
                     .unwrap_or(0);
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ea(sh_name),
-                    sh_type: ea(elf::SHT_NOBITS),
+                    sh_name: ede(sh_name),
+                    sh_type: ede(elf::SHT_NOBITS),
                     sh_flags,
-                    sh_addr: ea(ph.p_vaddr.getn() + data_sz),
+                    sh_addr: ede(ph.p_vaddr.getn() + data_sz),
                     sh_size: ph.p_memsz,
-                    sh_addralign: ea(sh_addralign),
+                    sh_addralign: ede(sh_addralign),
                     ..zeroed()
                 });
             }
@@ -167,8 +167,8 @@ fn main() -> eyre::Result<()> {
             .unwrap();
             rodata += 1;
             sht.push(elf::SectionHeader32 {
-                sh_name: ea(sh_name),
-                sh_type: ea(elf::SHT_PROGBITS),
+                sh_name: ede(sh_name),
+                sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
                 sh_offset: ph.p_offset,
@@ -183,10 +183,10 @@ fn main() -> eyre::Result<()> {
     shstr.finalize(&mut file, &mut eh, &mut sht)?;
 
     // Write section headers
-    eh.e_shoff = ea(file.seek(io::SeekFrom::End(0))?.try_into()?);
+    eh.e_shoff = ede(file.seek(io::SeekFrom::End(0))?.try_into()?);
     file.write_all(pod::bytes_of_slice(&sht))?;
-    eh.e_shentsize = ea(mem::size_of::<elf::SectionHeader32<TE>>().try_into()?);
-    eh.e_shnum = ea(sht.len().try_into()?);
+    eh.e_shentsize = ede(mem::size_of::<elf::SectionHeader32<TE>>().try_into()?);
+    eh.e_shnum = ede(sht.len().try_into()?);
 
     // Override ELF header
     file.rewind()?;
@@ -281,23 +281,24 @@ impl ShStrTab {
             .try_into()
             .expect("file size exceeded 32 bits");
         file.write_all(&self.data)?;
-        eh.e_shstrndx = ea(sht
+        eh.e_shstrndx = ede(sht
             .len()
             .try_into()
             .expect("exceeded 16 bit section header table limit"));
         sht.push(elf::SectionHeader32 {
-            sh_name: ea(sh_name),
-            sh_type: ea(elf::SHT_STRTAB),
-            sh_offset: ea(sh_offset),
-            sh_size: ea(self.size()),
-            sh_addralign: ea(1),
+            sh_name: ede(sh_name),
+            sh_type: ede(elf::SHT_STRTAB),
+            sh_offset: ede(sh_offset),
+            sh_size: ede(self.size()),
+            sh_addralign: ede(1),
             ..zeroed()
         });
         Ok(())
     }
 }
 
-fn ea<T>(n: T::Native) -> T
+/// Encode in default endian
+fn ede<T>(n: T::Native) -> T
 where
     T: DefaultEndianAgnosticUtils,
 {
