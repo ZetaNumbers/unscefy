@@ -1,7 +1,8 @@
 mod sce;
 
 use std::{
-    env, fs,
+    env,
+    fs::{self, File},
     io::{self, Read, Seek, Write},
     mem,
 };
@@ -67,9 +68,21 @@ fn main() -> eyre::Result<()> {
 
     // NULL section
     sht.push(zeroed());
-    let mut shstr = ShStrTab::new();
+    let mut shstr = StrTab::new();
 
     let [mut text, mut bss, mut data, mut rodata] = [0; 4];
+    let mut sh_name = |name, count: &mut _| {
+        let out = if *count == 0 {
+            std::write!(shstr, ".{name}")
+        } else {
+            std::write!(shstr, ".{name}{count}")
+        };
+        if out.is_ok() {
+            *count += 1;
+        }
+        out
+    };
+
     for ph in &pht {
         if ph.p_type.getn() != elf::PT_LOAD {
             continue;
@@ -84,17 +97,8 @@ fn main() -> eyre::Result<()> {
 
         if exec {
             assert_eq!(ph.p_filesz, ph.p_memsz);
-
-            let sh_name = if text == 0 {
-                std::write!(shstr, ".text")
-            } else {
-                std::write!(shstr, ".text{text}")
-            }
-            .unwrap();
-            text += 1;
-
             sht.push(elf::SectionHeader32 {
-                sh_name: ede(sh_name),
+                sh_name: ede(sh_name("text", &mut text)?),
                 sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
@@ -112,32 +116,18 @@ fn main() -> eyre::Result<()> {
                     .expect("sh_memsz < sh_filesz"),
             );
             if data_sz > 0 {
-                let sh_name = if data == 0 {
-                    std::write!(shstr, ".data")
-                } else {
-                    std::write!(shstr, ".data{data}")
-                }
-                .unwrap();
-                data += 1;
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ede(sh_name),
+                    sh_name: ede(sh_name("data", &mut data)?),
                     sh_type: ede(elf::SHT_PROGBITS),
                     sh_flags,
                     sh_addr: ph.p_vaddr,
                     sh_offset: ph.p_offset,
-                    sh_size: ph.p_filesz,
+                    sh_size: ede(data_sz),
                     sh_addralign: ph.p_align,
                     ..zeroed()
                 });
             }
             if bss_sz > 0 {
-                let sh_name = if bss == 0 {
-                    std::write!(shstr, ".bss")
-                } else {
-                    std::write!(shstr, ".bss{bss}")
-                }
-                .unwrap();
-                bss += 1;
                 let sh_addralign = ph.p_align.getn();
                 let sh_addralign = sh_addralign
                     .checked_shr(
@@ -147,27 +137,19 @@ fn main() -> eyre::Result<()> {
                     )
                     .unwrap_or(0);
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ede(sh_name),
+                    sh_name: ede(sh_name("bss", &mut bss)?),
                     sh_type: ede(elf::SHT_NOBITS),
                     sh_flags,
                     sh_addr: ede(ph.p_vaddr.getn() + data_sz),
-                    sh_size: ph.p_memsz,
+                    sh_size: ede(bss_sz),
                     sh_addralign: ede(sh_addralign),
                     ..zeroed()
                 });
             }
         } else if read {
             assert_eq!(ph.p_filesz, ph.p_memsz);
-
-            let sh_name = if rodata == 0 {
-                std::write!(shstr, ".rodata")
-            } else {
-                std::write!(shstr, ".rodata{rodata}")
-            }
-            .unwrap();
-            rodata += 1;
             sht.push(elf::SectionHeader32 {
-                sh_name: ede(sh_name),
+                sh_name: ede(sh_name("rodata", &mut rodata)?),
                 sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
@@ -180,7 +162,7 @@ fn main() -> eyre::Result<()> {
     }
 
     // Write section headers name table
-    shstr.finalize(&mut file, &mut eh, &mut sht)?;
+    shstr.finalize_shstrtab(&mut file, &mut eh, &mut sht)?;
 
     // Write section headers
     eh.e_shoff = ede(file.seek(io::SeekFrom::End(0))?.try_into()?);
@@ -195,7 +177,7 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn load_header(file: &mut fs::File) -> eyre::Result<elf::FileHeader32<TE>> {
+fn load_header(file: &mut File) -> eyre::Result<elf::FileHeader32<TE>> {
     let mut eh = zeroed::<elf::FileHeader32<TE>>();
     file.read_exact(pod::bytes_of_mut(&mut eh))?;
 
@@ -247,13 +229,13 @@ fn load_header(file: &mut fs::File) -> eyre::Result<elf::FileHeader32<TE>> {
     Ok(eh)
 }
 
-struct ShStrTab {
+struct StrTab {
     data: Vec<u8>,
 }
 
-impl ShStrTab {
+impl StrTab {
     fn new() -> Self {
-        ShStrTab { data: vec![b'\0'] }
+        StrTab { data: vec![b'\0'] }
     }
 
     fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<u32> {
@@ -266,15 +248,15 @@ impl ShStrTab {
         self.data
             .len()
             .try_into()
-            .expect("'.shstrtab' section size exceeded 32 bit limit")
+            .expect("'SHT_STRTAB' section size exceeded 32 bit limit")
     }
 
-    fn finalize(
+    fn finalize_shstrtab(
         mut self,
-        file: &mut fs::File,
+        file: &mut File,
         eh: &mut elf::FileHeader32<TE>,
         sht: &mut Vec<elf::SectionHeader32<TE>>,
-    ) -> io::Result<()> {
+    ) -> eyre::Result<u32> {
         let sh_name = write!(self, ".shstrtab")?;
         let sh_offset = file
             .seek(io::SeekFrom::End(0))?
@@ -285,6 +267,7 @@ impl ShStrTab {
             .len()
             .try_into()
             .expect("exceeded 16 bit section header table limit"));
+        let cur = sht.len().try_into()?;
         sht.push(elf::SectionHeader32 {
             sh_name: ede(sh_name),
             sh_type: ede(elf::SHT_STRTAB),
@@ -293,7 +276,30 @@ impl ShStrTab {
             sh_addralign: ede(1),
             ..zeroed()
         });
-        Ok(())
+        Ok(cur)
+    }
+
+    fn finalize_strtab(
+        mut self,
+        file: &mut File,
+        sht: &mut Vec<elf::SectionHeader32<TE>>,
+    ) -> eyre::Result<u32> {
+        let sh_name = write!(self, ".strtab")?;
+        let sh_offset = file
+            .seek(io::SeekFrom::End(0))?
+            .try_into()
+            .expect("file size exceeded 32 bits");
+        file.write_all(&self.data)?;
+        let cur = sht.len().try_into()?;
+        sht.push(elf::SectionHeader32 {
+            sh_name: ede(sh_name),
+            sh_type: ede(elf::SHT_STRTAB),
+            sh_offset: ede(sh_offset),
+            sh_size: ede(self.size()),
+            sh_addralign: ede(1),
+            ..zeroed()
+        });
+        Ok(cur)
     }
 }
 
