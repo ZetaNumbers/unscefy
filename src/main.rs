@@ -20,8 +20,6 @@ const ALL_ET_SCE: [u16; 7] = [
     sce::ET_SCE_UNK,
 ];
 
-const _: () = assert!(mem::size_of::<isize>() >= 4);
-
 /// target endian
 type TE = object::LittleEndian;
 
@@ -45,31 +43,28 @@ fn main() -> eyre::Result<()> {
     let mut eh = load_header(&mut file)
         .wrap_err("Error while loading ELF file header, perhaps input file is not an ELF")?;
 
-    let mut pht = vec![zeroed::<elf::ProgramHeader32<TE>>(); eh.e_phnum.getn() as usize];
+    let pht = load_program_headers(&eh, &mut file)?;
 
-    if !pht.is_empty() {
-        file.seek(io::SeekFrom::Start(eh.e_phoff.getn().into()))?;
-        file.read_exact(pod::bytes_of_slice_mut(&mut pht))?;
-    }
-
-    let mut sht = vec![zeroed::<elf::SectionHeader32<TE>>(); eh.e_shnum.getn() as usize];
-    if !sht.is_empty() {
-        file.seek(io::SeekFrom::Start(eh.e_shoff.getn().into()))?;
-        file.read_exact(pod::bytes_of_slice_mut(&mut sht))?;
-    }
+    let mut sht = load_section_headers(&eh, &mut file)?;
     assert!(sht.is_empty());
-    assert!(pht.iter().all(|ph| [
-        elf::PT_LOAD,
-        sce::PT_SCE_RELA,
-        sce::PT_SCE_COMMENT,
-        sce::PT_SCE_VERSION
-    ]
-    .contains(&ph.p_type.getn())));
-
     // NULL section
     sht.push(zeroed());
-    let mut shstr = StrTab::new();
 
+    let mut shstr = StrTab::new();
+    sht.extend(sections_from_segments(&pht, &mut shstr)?);
+
+    shstr.store_shstrtab(&mut sht, &mut eh, &mut file)?;
+    store_section_headers(&sht, &mut eh, &mut file)?;
+    store_header(&eh, &mut file)?;
+
+    Ok(())
+}
+
+fn sections_from_segments(
+    pht: &[elf::ProgramHeader32<TE>],
+    shstr: &mut StrTab,
+) -> eyre::Result<Vec<elf::SectionHeader32<TE>>> {
+    let mut sht = Vec::new();
     let [mut text, mut bss, mut data, mut rodata] = [0; 4];
     let mut sh_name = |name, count: &mut _| {
         let out = if *count == 0 {
@@ -82,8 +77,7 @@ fn main() -> eyre::Result<()> {
         }
         out
     };
-
-    for ph in &pht {
+    for ph in pht {
         if ph.p_type.getn() != elf::PT_LOAD {
             continue;
         }
@@ -91,8 +85,9 @@ fn main() -> eyre::Result<()> {
         let read = (ph.p_flags.getn() & elf::PF_R) != 0;
         let writ = (ph.p_flags.getn() & elf::PF_W) != 0;
         let exec = (ph.p_flags.getn() & elf::PF_X) != 0;
-        let sh_flags =
-            (writ as u32 * elf::SHF_WRITE) | (exec as u32 * elf::SHF_EXECINSTR) | elf::SHF_ALLOC;
+        let sh_flags = (u32::from(writ) * elf::SHF_WRITE)
+            | (u32::from(exec) * elf::SHF_EXECINSTR)
+            | elf::SHF_ALLOC;
         let sh_flags = ede(sh_flags);
 
         if exec {
@@ -161,26 +156,65 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    // Write section headers name table
-    shstr.finalize_shstrtab(&mut file, &mut eh, &mut sht)?;
+    Ok(sht)
+}
 
-    // Write section headers
-    eh.e_shoff = ede(file.seek(io::SeekFrom::End(0))?.try_into()?);
-    file.write_all(pod::bytes_of_slice(&sht))?;
+fn load_section_headers(
+    eh: &elf::FileHeader32<TE>,
+    file: &mut File,
+) -> eyre::Result<Vec<elf::SectionHeader32<TE>>> {
+    let mut sht = vec![zeroed::<elf::SectionHeader32<TE>>(); eh.e_shnum.getn().into()];
+    if !sht.is_empty() {
+        file.seek(io::SeekFrom::Start(eh.e_shoff.getn().into()))?;
+        file.read_exact(pod::bytes_of_slice_mut(&mut sht))?;
+    }
+    Ok(sht)
+}
+
+fn store_section_headers(
+    sht: &[elf::SectionHeader32<TE>],
+    eh: &mut elf::FileHeader32<TE>,
+    file: &mut File,
+) -> eyre::Result<()> {
+    eh.e_shoff = ede(append_file(file, pod::bytes_of_slice(sht))?.try_into()?);
     eh.e_shentsize = ede(mem::size_of::<elf::SectionHeader32<TE>>().try_into()?);
     eh.e_shnum = ede(sht.len().try_into()?);
-
-    // Override ELF header
-    file.rewind()?;
-    file.write_all(pod::bytes_of(&eh))?;
-
     Ok(())
+}
+
+fn load_program_headers(
+    eh: &elf::FileHeader32<TE>,
+    file: &mut File,
+) -> eyre::Result<Vec<elf::ProgramHeader32<TE>>> {
+    let mut pht = vec![zeroed::<elf::ProgramHeader32<TE>>(); eh.e_phnum.getn().into()];
+    if !pht.is_empty() {
+        file.seek(io::SeekFrom::Start(eh.e_phoff.getn().into()))?;
+        file.read_exact(pod::bytes_of_slice_mut(&mut pht))?;
+    }
+    assert!(pht.iter().all(|ph| [
+        elf::PT_LOAD,
+        sce::PT_SCE_RELA,
+        sce::PT_SCE_COMMENT,
+        sce::PT_SCE_VERSION
+    ]
+    .contains(&ph.p_type.getn())));
+    Ok(pht)
 }
 
 fn load_header(file: &mut File) -> eyre::Result<elf::FileHeader32<TE>> {
     let mut eh = zeroed::<elf::FileHeader32<TE>>();
     file.read_exact(pod::bytes_of_mut(&mut eh))?;
+    ensure_header(eh)?;
+    Ok(eh)
+}
 
+fn store_header(eh: &elf::FileHeader32<TE>, file: &mut File) -> eyre::Result<()> {
+    file.rewind()?;
+    file.write_all(pod::bytes_of(eh))?;
+    Ok(())
+}
+
+fn ensure_header(eh: elf::FileHeader32<TE>) -> eyre::Result<()> {
     eyre::ensure!(
         eh.e_ident.magic == elf::ELFMAG,
         "Wrong ELF magic: {:x?}",
@@ -226,7 +260,7 @@ fn load_header(file: &mut File) -> eyre::Result<elf::FileHeader32<TE>> {
         eh.e_type.getn()
     );
 
-    Ok(eh)
+    Ok(())
 }
 
 struct StrTab {
@@ -251,22 +285,14 @@ impl StrTab {
             .expect("'SHT_STRTAB' section size exceeded 32 bit limit")
     }
 
-    fn finalize_shstrtab(
+    fn store_shstrtab(
         mut self,
-        file: &mut File,
-        eh: &mut elf::FileHeader32<TE>,
         sht: &mut Vec<elf::SectionHeader32<TE>>,
+        eh: &mut elf::FileHeader32<TE>,
+        file: &mut File,
     ) -> eyre::Result<u32> {
+        let sh_offset = append_file(file, &self.data)?.try_into()?;
         let sh_name = write!(self, ".shstrtab")?;
-        let sh_offset = file
-            .seek(io::SeekFrom::End(0))?
-            .try_into()
-            .expect("file size exceeded 32 bits");
-        file.write_all(&self.data)?;
-        eh.e_shstrndx = ede(sht
-            .len()
-            .try_into()
-            .expect("exceeded 16 bit section header table limit"));
         let cur = sht.len().try_into()?;
         sht.push(elf::SectionHeader32 {
             sh_name: ede(sh_name),
@@ -276,20 +302,17 @@ impl StrTab {
             sh_addralign: ede(1),
             ..zeroed()
         });
-        Ok(cur)
+        eh.e_shstrndx = ede(cur);
+        Ok(cur.into())
     }
 
-    fn finalize_strtab(
+    fn store_strtab(
         mut self,
         file: &mut File,
         sht: &mut Vec<elf::SectionHeader32<TE>>,
     ) -> eyre::Result<u32> {
         let sh_name = write!(self, ".strtab")?;
-        let sh_offset = file
-            .seek(io::SeekFrom::End(0))?
-            .try_into()
-            .expect("file size exceeded 32 bits");
-        file.write_all(&self.data)?;
+        let sh_offset = append_file(file, &self.data)?.try_into()?;
         let cur = sht.len().try_into()?;
         sht.push(elf::SectionHeader32 {
             sh_name: ede(sh_name),
@@ -346,6 +369,12 @@ where
     fn from_native(n: Self::Native) -> Self {
         Self::new(Default::default(), n)
     }
+}
+
+fn append_file(file: &mut File, data: &[u8]) -> io::Result<u64> {
+    let cursor = file.seek(io::SeekFrom::End(0))?;
+    file.write_all(data)?;
+    Ok(cursor)
 }
 
 fn zeroed<T>() -> T
