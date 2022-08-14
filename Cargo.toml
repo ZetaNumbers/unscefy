@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 color-eyre = "0.6.2"
+futures = { version = "0.3.21", features = ["executor"] }
 object = { version = "0.29.0", default-features = false, features = ["elf"] }

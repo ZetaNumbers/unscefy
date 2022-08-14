@@ -1,7 +1,13 @@
+#![feature(cstr_from_bytes_until_nul)]
+
 mod sce;
+mod strtab;
+mod symtab;
 
 use std::{
+    cell::RefCell,
     env,
+    ffi::CStr,
     fs::{self, File},
     io::{self, Read, Seek, Write},
     mem,
@@ -9,6 +15,9 @@ use std::{
 
 use color_eyre::eyre::{self, Context};
 use object::{elf, endian, pod};
+use strtab::StrTab;
+
+use crate::symtab::SymTab;
 
 const ALL_ET_SCE: [u16; 7] = [
     sce::ET_SCE_EXEC,
@@ -51,32 +60,63 @@ fn main() -> eyre::Result<()> {
     sht.push(zeroed());
 
     let mut shstr = StrTab::new();
-    sht.extend(sections_from_segments(&pht, &mut shstr)?);
+    sht.extend(sections_from_segments(&pht, &mut shstr));
+    let (symtab, symproxy) = SymTab::new();
+    add_section_symbols(&sht, &shstr, &symproxy);
 
-    shstr.store_shstrtab(&mut sht, &mut eh, &mut file)?;
-    store_section_headers(&sht, &mut eh, &mut file)?;
-    store_header(&eh, &mut file)?;
+    let mut file = RefCell::new(file);
+    symproxy.close();
+    futures::executor::block_on(symtab.store(&file, &mut sht, &mut shstr, Link::Static));
+    shstr.store_shstrtab(&mut sht, &mut eh, file.get_mut());
+    store_section_headers(&sht, &mut eh, file.get_mut())?;
+    store_header(&eh, file.get_mut())?;
 
     Ok(())
+}
+
+fn add_section_symbols(
+    sht: &[elf::SectionHeader32<TE>],
+    shstrtab: &StrTab,
+    symtab: &symtab::Proxy,
+) {
+    sht.iter()
+        .enumerate()
+        .filter(|(_i, sh)| sh.sh_type.getn() != elf::SHT_NULL)
+        .for_each(|(i, sh)| {
+            let name = sh.sh_name.getn().try_into().unwrap();
+            let name = CStr::from_bytes_until_nul(&shstrtab.strings()[name..]).unwrap();
+            let mut symbol = elf::Sym32 {
+                st_size: sh.sh_size,
+                st_other: elf::STV_DEFAULT,
+                st_shndx: ede(i.try_into().unwrap()),
+                ..zeroed()
+            };
+            symbol.set_st_info(elf::STB_LOCAL, elf::STT_SECTION);
+            let _ = symtab.add_symbol(name.into(), symbol).unwrap();
+        })
 }
 
 fn sections_from_segments(
     pht: &[elf::ProgramHeader32<TE>],
     shstr: &mut StrTab,
-) -> eyre::Result<Vec<elf::SectionHeader32<TE>>> {
+) -> Vec<elf::SectionHeader32<TE>> {
     let mut sht = Vec::new();
-    let [mut text, mut bss, mut data, mut rodata] = [0; 4];
-    let mut sh_name = |name, count: &mut _| {
-        let out = if *count == 0 {
-            std::write!(shstr, ".{name}")
+
+    let text = &mut ("text", 0);
+    let bss = &mut ("bss", 0);
+    let data = &mut ("data", 0);
+    let rodata = &mut ("rodata", 0);
+    let mut sh_name = |(name, count): &mut (&str, u32)| {
+        let name = if *count == 0 {
+            format!(".{name}\0")
         } else {
-            std::write!(shstr, ".{name}{count}")
+            format!(".{name}{count}\0")
         };
-        if out.is_ok() {
-            *count += 1;
-        }
+        let out = shstr.push_cstr(CStr::from_bytes_with_nul(name.as_ref()).unwrap());
+        *count += 1;
         out
     };
+
     for ph in pht {
         if ph.p_type.getn() != elf::PT_LOAD {
             continue;
@@ -93,7 +133,7 @@ fn sections_from_segments(
         if exec {
             assert_eq!(ph.p_filesz, ph.p_memsz);
             sht.push(elf::SectionHeader32 {
-                sh_name: ede(sh_name("text", &mut text)?),
+                sh_name: ede(sh_name(text)),
                 sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
@@ -112,7 +152,7 @@ fn sections_from_segments(
             );
             if data_sz > 0 {
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ede(sh_name("data", &mut data)?),
+                    sh_name: ede(sh_name(data)),
                     sh_type: ede(elf::SHT_PROGBITS),
                     sh_flags,
                     sh_addr: ph.p_vaddr,
@@ -132,7 +172,7 @@ fn sections_from_segments(
                     )
                     .unwrap_or(0);
                 sht.push(elf::SectionHeader32 {
-                    sh_name: ede(sh_name("bss", &mut bss)?),
+                    sh_name: ede(sh_name(bss)),
                     sh_type: ede(elf::SHT_NOBITS),
                     sh_flags,
                     sh_addr: ede(ph.p_vaddr.getn() + data_sz),
@@ -144,7 +184,7 @@ fn sections_from_segments(
         } else if read {
             assert_eq!(ph.p_filesz, ph.p_memsz);
             sht.push(elf::SectionHeader32 {
-                sh_name: ede(sh_name("rodata", &mut rodata)?),
+                sh_name: ede(sh_name(rodata)),
                 sh_type: ede(elf::SHT_PROGBITS),
                 sh_flags,
                 sh_addr: ph.p_vaddr,
@@ -156,7 +196,7 @@ fn sections_from_segments(
         }
     }
 
-    Ok(sht)
+    sht
 }
 
 fn load_section_headers(
@@ -263,67 +303,10 @@ fn ensure_header(eh: elf::FileHeader32<TE>) -> eyre::Result<()> {
     Ok(())
 }
 
-struct StrTab {
-    data: Vec<u8>,
-}
-
-impl StrTab {
-    fn new() -> Self {
-        StrTab { data: vec![b'\0'] }
-    }
-
-    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<u32> {
-        let cur = self.size();
-        self.data.write_fmt(format_args!("{args}\0"))?;
-        Ok(cur)
-    }
-
-    fn size(&self) -> u32 {
-        self.data
-            .len()
-            .try_into()
-            .expect("'SHT_STRTAB' section size exceeded 32 bit limit")
-    }
-
-    fn store_shstrtab(
-        mut self,
-        sht: &mut Vec<elf::SectionHeader32<TE>>,
-        eh: &mut elf::FileHeader32<TE>,
-        file: &mut File,
-    ) -> eyre::Result<u32> {
-        let sh_offset = append_file(file, &self.data)?.try_into()?;
-        let sh_name = write!(self, ".shstrtab")?;
-        let cur = sht.len().try_into()?;
-        sht.push(elf::SectionHeader32 {
-            sh_name: ede(sh_name),
-            sh_type: ede(elf::SHT_STRTAB),
-            sh_offset: ede(sh_offset),
-            sh_size: ede(self.size()),
-            sh_addralign: ede(1),
-            ..zeroed()
-        });
-        eh.e_shstrndx = ede(cur);
-        Ok(cur.into())
-    }
-
-    fn store_strtab(
-        mut self,
-        file: &mut File,
-        sht: &mut Vec<elf::SectionHeader32<TE>>,
-    ) -> eyre::Result<u32> {
-        let sh_name = write!(self, ".strtab")?;
-        let sh_offset = append_file(file, &self.data)?.try_into()?;
-        let cur = sht.len().try_into()?;
-        sht.push(elf::SectionHeader32 {
-            sh_name: ede(sh_name),
-            sh_type: ede(elf::SHT_STRTAB),
-            sh_offset: ede(sh_offset),
-            sh_size: ede(self.size()),
-            sh_addralign: ede(1),
-            ..zeroed()
-        });
-        Ok(cur)
-    }
+#[derive(Clone, Copy, Debug)]
+pub enum Link {
+    Dynamic,
+    Static,
 }
 
 /// Encode in default endian
