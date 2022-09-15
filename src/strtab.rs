@@ -47,7 +47,7 @@ impl StrTab {
     }
 
     pub fn store_strtab(
-        mut self,
+        self,
         file: &mut File,
         sht: &mut Vec<elf::SectionHeader32<TE>>,
         shstrtab: &mut StrTab,
@@ -75,10 +75,6 @@ impl StrTab {
             ..zeroed()
         });
         cur
-    }
-
-    pub fn base_indices(&self) -> &[u32] {
-        self.base_indices.as_ref()
     }
 
     pub fn strings(&self) -> &[u8] {
