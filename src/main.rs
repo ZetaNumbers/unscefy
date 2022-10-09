@@ -19,15 +19,18 @@ use strtab::StrTab;
 
 use crate::symtab::SymTab;
 
-const ALL_ET_SCE: [u16; 7] = [
-    sce::ET_SCE_EXEC,
-    sce::ET_SCE_RELEXEC,
-    sce::ET_SCE_STUBLIB,
-    sce::ET_SCE_DYNAMIC,
-    sce::ET_SCE_PSPRELEXEC,
-    sce::ET_SCE_PPURELEXEC,
-    sce::ET_SCE_UNK,
-];
+fn is_et_sce(e_type: u16) -> bool {
+    matches!(
+        e_type,
+        sce::ET_SCE_EXEC
+            | sce::ET_SCE_RELEXEC
+            | sce::ET_SCE_STUBLIB
+            | sce::ET_SCE_DYNAMIC
+            | sce::ET_SCE_PSPRELEXEC
+            | sce::ET_SCE_PPURELEXEC
+            | sce::ET_SCE_UNK
+    )
+}
 
 /// target endian
 type TE = object::LittleEndian;
@@ -231,13 +234,10 @@ fn load_program_headers(
         file.seek(io::SeekFrom::Start(eh.e_phoff.getn().into()))?;
         file.read_exact(pod::bytes_of_slice_mut(&mut pht))?;
     }
-    assert!(pht.iter().all(|ph| [
-        elf::PT_LOAD,
-        sce::PT_SCE_RELA,
-        sce::PT_SCE_COMMENT,
-        sce::PT_SCE_VERSION
-    ]
-    .contains(&ph.p_type.getn())));
+    assert!(pht.iter().all(|ph| matches!(
+        ph.p_type.getn(),
+        elf::PT_LOAD | sce::PT_SCE_RELA | sce::PT_SCE_COMMENT | sce::PT_SCE_VERSION
+    )));
     Ok(pht)
 }
 
@@ -295,7 +295,7 @@ fn ensure_header(eh: elf::FileHeader32<TE>) -> eyre::Result<()> {
         );
     }
     eyre::ensure!(
-        ALL_ET_SCE.contains(&eh.e_type.getn()),
+        is_et_sce(eh.e_type.getn()),
         "Wrong ELF type: {}",
         eh.e_type.getn()
     );
