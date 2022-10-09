@@ -7,7 +7,7 @@ mod symtab;
 use std::{
     cell::RefCell,
     env,
-    ffi::CStr,
+    ffi::{CStr, CString},
     fs::{self, File},
     io::{self, Read, Seek, Write},
     mem,
@@ -66,6 +66,7 @@ fn main() -> eyre::Result<()> {
     sht.extend(sections_from_segments(&pht, &mut shstr));
     let (symtab, symproxy) = SymTab::new();
     add_section_symbols(&sht, &shstr, &symproxy);
+    add_sce_symbols(&eh, &sht, &pht, &symproxy, &mut file);
 
     let mut file = RefCell::new(file);
     symproxy.close();
@@ -75,6 +76,47 @@ fn main() -> eyre::Result<()> {
     store_header(&eh, file.get_mut())?;
 
     Ok(())
+}
+
+fn add_sce_symbols(
+    eh: &elf::FileHeader32<TE>,
+    sht: &[elf::SectionHeader32<TE>],
+    pht: &[elf::ProgramHeader32<TE>],
+    symtab: &symtab::Proxy,
+    file: &mut File,
+) {
+    let (module_info_offset, module_info_phndx) = match eh.e_type.getn() {
+        sce::ET_SCE_RELEXEC => (
+            eh.e_entry.getn() & 0x3fffffff,
+            eh.e_entry.getn() >> 30 & 0b11,
+        ),
+        sce::ET_SCE_EXEC => todo!("ET_SCE_EXEC"),
+        other => panic!("Unknown ELF type: {other}"),
+    };
+    let module_info_file_offset = pht[usize::try_from(module_info_phndx).unwrap()]
+        .p_offset
+        .getn()
+        + module_info_offset;
+    file.seek(io::SeekFrom::Start(module_info_file_offset.into()))
+        .unwrap();
+    let module_info = sce::SceModuleInfo::from_reader(file).unwrap();
+
+    if let Some((i, sh)) = sht.iter().enumerate().find(|(_, sh)| {
+        (sh.sh_offset.getn()..sh.sh_offset.getn() + sh.sh_size.getn())
+            .contains(&module_info_file_offset.try_into().unwrap())
+    }) {
+        let vaddr = module_info_offset + sh.sh_addr.getn();
+        let mut symbol = elf::Sym32 {
+            st_value: ede(vaddr),
+            st_size: ede(module_info.as_bytes().len().try_into().unwrap()),
+            st_shndx: ede(i.try_into().unwrap()),
+            ..zeroed()
+        };
+        symbol.set_st_info(elf::STB_LOCAL, elf::STT_NOTYPE);
+        let _ = symtab
+            .add_symbol(CString::new(".sceModuleInfo.rodata").unwrap(), symbol)
+            .unwrap();
+    }
 }
 
 fn add_section_symbols(
