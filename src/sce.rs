@@ -182,6 +182,6 @@ where
     let mut v = T::zeroed();
     let mut b = bytemuck::bytes_of_mut(&mut v);
     b.write_all(bytemuck::bytes_of(&common)).unwrap();
-    io::copy(x, &mut b)?;
+    x.read_exact(b)?;
     Ok(v)
 }
