@@ -6,11 +6,12 @@ mod symtab;
 
 use std::{
     cell::RefCell,
-    env,
+    cmp, env,
     ffi::{CStr, CString},
     fs::{self, File},
     io::{self, Read, Seek, Write},
-    mem,
+    iter, mem,
+    ops::Range,
 };
 
 use color_eyre::eyre::{self, Context};
@@ -93,29 +94,81 @@ fn add_sce_symbols(
         sce::ET_SCE_EXEC => todo!("ET_SCE_EXEC"),
         other => panic!("Unknown ELF type: {other}"),
     };
-    let module_info_file_offset = pht[usize::try_from(module_info_phndx).unwrap()]
-        .p_offset
-        .getn()
-        + module_info_offset;
+    let program_header = &pht[usize::try_from(module_info_phndx).unwrap()];
+
+    // SceModuleInfo
+    let module_info_file_offset = program_header.p_offset.getn() + module_info_offset;
     file.seek(io::SeekFrom::Start(module_info_file_offset.into()))
         .unwrap();
     let module_info = sce::SceModuleInfo::from_reader(file).unwrap();
 
+    add_symbol_from_file_location(
+        sht,
+        symtab,
+        module_info_file_offset
+            ..module_info_file_offset + u32::try_from(module_info.as_bytes().len()).unwrap(),
+        CString::new("SceModuleInfo").unwrap(),
+    );
+
+    // SceLibStubTable
+    let lib_stub_table_file_offset = program_header.p_offset.getn() + module_info.stub_top();
+    let lib_stub_table_end_file_offset = program_header.p_offset.getn() + module_info.stub_btm();
+
+    add_symbol_from_file_location(
+        sht,
+        symtab,
+        lib_stub_table_file_offset..lib_stub_table_end_file_offset,
+        CString::new("SceLibStubTables").unwrap(),
+    );
+
+    file.seek(io::SeekFrom::Start(lib_stub_table_file_offset.into()))
+        .unwrap();
+    iter::repeat_with(|| (&*file).stream_position().unwrap())
+        .take_while(
+            |fpos| match fpos.cmp(&lib_stub_table_end_file_offset.into()) {
+                cmp::Ordering::Less => true,
+                cmp::Ordering::Equal => false,
+                cmp::Ordering::Greater => panic!("unaligned lib stub tables"),
+            },
+        )
+        .map(|fpos| {
+            (
+                fpos,
+                sce::SceLibStubTable::from_reader(&mut &*file).unwrap(),
+            )
+        })
+        .enumerate()
+        .for_each(|(i, (fpos, stub_table))| {
+            let fpos = u32::try_from(fpos).unwrap();
+            let size = u32::try_from(stub_table.as_bytes().len()).unwrap();
+            add_symbol_from_file_location(
+                sht,
+                symtab,
+                fpos..fpos + size,
+                CString::new(format!("SceLibStubTable{i}")).unwrap(),
+            );
+        });
+}
+
+fn add_symbol_from_file_location(
+    sht: &[elf::SectionHeader32<object::LittleEndian>],
+    symtab: &symtab::Proxy,
+    file_location: Range<u32>,
+    symbol_name: CString,
+) {
     if let Some((i, sh)) = sht.iter().enumerate().find(|(_, sh)| {
-        (sh.sh_offset.getn()..sh.sh_offset.getn() + sh.sh_size.getn())
-            .contains(&module_info_file_offset.try_into().unwrap())
+        let sh_file_range = sh.sh_offset.getn()..sh.sh_offset.getn() + sh.sh_size.getn();
+        sh_file_range.contains(&file_location.start) && sh_file_range.contains(&file_location.end)
     }) {
-        let vaddr = module_info_offset + sh.sh_addr.getn();
+        let vaddr = file_location.start - sh.sh_offset.getn() + sh.sh_addr.getn();
         let mut symbol = elf::Sym32 {
             st_value: ede(vaddr),
-            st_size: ede(module_info.as_bytes().len().try_into().unwrap()),
+            st_size: ede(file_location.end - file_location.start),
             st_shndx: ede(i.try_into().unwrap()),
             ..zeroed()
         };
         symbol.set_st_info(elf::STB_LOCAL, elf::STT_NOTYPE);
-        let _ = symtab
-            .add_symbol(CString::new(".sceModuleInfo.rodata").unwrap(), symbol)
-            .unwrap();
+        let _ = symtab.add_symbol(symbol_name, symbol).unwrap();
     }
 }
 
