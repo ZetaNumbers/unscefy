@@ -285,6 +285,14 @@ impl SceLibStubTable {
             SceLibStubTable::S34(m) => bytemuck::bytes_of(m),
         }
     }
+
+    pub fn libname(&self) -> &Elf32_Addr {
+        match self {
+            SceLibStubTable::S24(m) => &m.libname,
+            SceLibStubTable::S2C(m) => &m.libname,
+            SceLibStubTable::S34(m) => &m.libname,
+        }
+    }
 }
 
 fn continue_read<C, R, T>(common: &C, x: &mut R) -> io::Result<T>

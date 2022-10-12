@@ -102,74 +102,127 @@ fn add_sce_symbols(
         .unwrap();
     let module_info = sce::SceModuleInfo::from_reader(file).unwrap();
 
-    add_symbol_from_file_location(
+    add_symbol_via_fpos(
         sht,
-        symtab,
         module_info_file_offset
             ..module_info_file_offset + u32::try_from(module_info.as_bytes().len()).unwrap(),
+        symtab,
         CString::new("SceModuleInfo").unwrap(),
-    );
+    )
+    .unwrap();
 
     // SceLibStubTable
-    let lib_stub_table_file_offset = program_header.p_offset.getn() + module_info.stub_top();
-    let lib_stub_table_end_file_offset = program_header.p_offset.getn() + module_info.stub_btm();
+    let mut lib_stub_table_fpos = program_header.p_offset.getn() + module_info.stub_top();
+    let lib_stub_table_end_fpos = program_header.p_offset.getn() + module_info.stub_btm();
 
-    add_symbol_from_file_location(
+    add_symbol_via_fpos(
         sht,
+        lib_stub_table_fpos..lib_stub_table_end_fpos,
         symtab,
-        lib_stub_table_file_offset..lib_stub_table_end_file_offset,
         CString::new("SceLibStubTables").unwrap(),
-    );
+    )
+    .unwrap();
 
-    file.seek(io::SeekFrom::Start(lib_stub_table_file_offset.into()))
-        .unwrap();
-    iter::repeat_with(|| (&*file).stream_position().unwrap())
-        .take_while(
-            |fpos| match fpos.cmp(&lib_stub_table_end_file_offset.into()) {
-                cmp::Ordering::Less => true,
-                cmp::Ordering::Equal => false,
-                cmp::Ordering::Greater => panic!("unaligned lib stub tables"),
-            },
+    let mut i = 0;
+    loop {
+        match lib_stub_table_fpos.cmp(&lib_stub_table_end_fpos.into()) {
+            cmp::Ordering::Less => (),
+            cmp::Ordering::Equal => break,
+            cmp::Ordering::Greater => panic!("unaligned lib stub tables"),
+        }
+
+        file.seek(io::SeekFrom::Start(lib_stub_table_fpos.into()))
+            .unwrap();
+        let stub_table = sce::SceLibStubTable::from_reader(&mut &*file).unwrap();
+
+        let fpos = u32::try_from(lib_stub_table_fpos).unwrap();
+        let size = u32::try_from(stub_table.as_bytes().len()).unwrap();
+        lib_stub_table_fpos += size;
+
+        let libname_vaddr = *stub_table.libname();
+        let libname_fpos = fpos_from_vaddr(pht, libname_vaddr).unwrap();
+
+        file.seek(io::SeekFrom::Start(libname_fpos.into())).unwrap();
+        let libname: Vec<u8> = file
+            .bytes()
+            .map(|b| b.unwrap())
+            .take_while(|b| *b != 0)
+            .collect();
+        let libname = String::from_utf8_lossy(&libname);
+
+        add_symbol_via_fpos(
+            sht,
+            fpos..fpos + size,
+            symtab,
+            CString::new(format!("SceLibStubTable{i}:{libname}")).unwrap(),
         )
-        .map(|fpos| {
-            (
-                fpos,
-                sce::SceLibStubTable::from_reader(&mut &*file).unwrap(),
-            )
-        })
-        .enumerate()
-        .for_each(|(i, (fpos, stub_table))| {
-            let fpos = u32::try_from(fpos).unwrap();
-            let size = u32::try_from(stub_table.as_bytes().len()).unwrap();
-            add_symbol_from_file_location(
-                sht,
-                symtab,
-                fpos..fpos + size,
-                CString::new(format!("SceLibStubTable{i}")).unwrap(),
-            );
-        });
+        .unwrap();
+
+        i += 1;
+    }
 }
 
-fn add_symbol_from_file_location(
-    sht: &[elf::SectionHeader32<object::LittleEndian>],
+fn add_symbol_via_fpos(
+    sht: &[elf::SectionHeader32<TE>],
+    frange: Range<u32>,
     symtab: &symtab::Proxy,
-    file_location: Range<u32>,
     symbol_name: CString,
-) {
-    if let Some((i, sh)) = sht.iter().enumerate().find(|(_, sh)| {
-        let sh_file_range = sh.sh_offset.getn()..sh.sh_offset.getn() + sh.sh_size.getn();
-        sh_file_range.contains(&file_location.start) && sh_file_range.contains(&file_location.end)
-    }) {
-        let vaddr = file_location.start - sh.sh_offset.getn() + sh.sh_addr.getn();
-        let mut symbol = elf::Sym32 {
-            st_value: ede(vaddr),
-            st_size: ede(file_location.end - file_location.start),
-            st_shndx: ede(i.try_into().unwrap()),
-            ..zeroed()
-        };
-        symbol.set_st_info(elf::STB_LOCAL, elf::STT_NOTYPE);
-        let _ = symtab.add_symbol(symbol_name, symbol).unwrap();
-    }
+) -> Result<(), Error> {
+    let (i, sh) = sht
+        .iter()
+        .enumerate()
+        .find(|(_, sh)| {
+            let sh_file_range = sh.sh_offset.getn()..sh.sh_offset.getn() + sh.sh_size.getn();
+            sh_file_range.contains(&frange.start) && sh_file_range.contains(&frange.end)
+        })
+        .ok_or(Error::FposOutsideOfSections)?;
+
+    let vaddr = frange.start - sh.sh_offset.getn() + sh.sh_addr.getn();
+    let mut symbol = elf::Sym32 {
+        st_value: ede(vaddr),
+        st_size: ede(frange.end - frange.start),
+        st_shndx: ede(i.try_into().unwrap()),
+        ..zeroed()
+    };
+    symbol.set_st_info(elf::STB_LOCAL, elf::STT_NOTYPE);
+    let _ = symtab.add_symbol(symbol_name, symbol).unwrap();
+
+    Ok(())
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+enum Error {
+    FposOutsideOfSections,
+    NoFposForVaddr,
+}
+
+fn fpos_from_vaddr_range(
+    pht: &[elf::ProgramHeader32<TE>],
+    vrange: Range<u32>,
+) -> Result<Range<u32>, Error> {
+    let ph = pht
+        .iter()
+        .find(|ph| {
+            let p_frange = ph.p_vaddr.getn()..ph.p_vaddr.getn() + ph.p_filesz.getn();
+            p_frange.contains(&vrange.start) && p_frange.contains(&vrange.end)
+        })
+        .ok_or(Error::NoFposForVaddr)?;
+
+    Ok(vrange.start - ph.p_vaddr.getn() + ph.p_offset.getn()
+        ..vrange.end - ph.p_vaddr.getn() + ph.p_offset.getn())
+}
+
+fn fpos_from_vaddr(pht: &[elf::ProgramHeader32<TE>], vaddr: u32) -> Result<u32, Error> {
+    let ph = pht
+        .iter()
+        .find(|ph| {
+            let p_frange = ph.p_vaddr.getn()..ph.p_vaddr.getn() + ph.p_filesz.getn();
+            p_frange.contains(&vaddr)
+        })
+        .ok_or(Error::NoFposForVaddr)?;
+
+    Ok(vaddr - ph.p_vaddr.getn() + ph.p_offset.getn())
 }
 
 fn add_section_symbols(
